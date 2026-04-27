@@ -1,0 +1,8 @@
+.gradle/
+build/
+app/build/
+local.properties
+
+# Offline model files are copied locally for Android packaging.
+# Keep them outside Git; point MOSS_TTS_MODEL_DIR or -PmossTtsModelDir at the final model directory.
+app/src/main/assets/models/

@@ -149,6 +149,7 @@ slurmlogs_*/
 
 dev/
 .vscode/
+.superpowers/
 
 config/debug
 .vscode/

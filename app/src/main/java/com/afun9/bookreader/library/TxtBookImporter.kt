@@ -3,7 +3,7 @@ package com.afun9.bookreader.library
 import java.security.MessageDigest
 
 class TxtBookImporter : BookImporter {
-    private val chapterPattern = Regex("""(?m)^[ \t]*(第[一二三四五六七八九十百千万0-9]+章)([ \t]*.*)$""")
+    private val chapterPattern = Regex("""(?m)^[ \t]*(第[一二三四五六七八九十百千万0-9]+[章回])([ \t：:]*.*)$""")
 
     override fun importText(fileName: String, content: String): ImportedBook {
         val title = fileName.substringBeforeLast('.').trim().ifBlank { "未命名小说" }

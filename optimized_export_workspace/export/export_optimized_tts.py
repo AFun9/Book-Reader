@@ -52,6 +52,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="TTS graph weight precision. fp16 reduces size and keeps graph I/O as fp32.",
     )
     parser.add_argument(
+        "--codec-precision",
+        choices=("fp32", "fp16"),
+        default=None,
+        help="Codec graph weight precision. Defaults to the same value as --precision.",
+    )
+    parser.add_argument(
         "--offline-ort-optimize",
         action="store_true",
         help="Save ORT_ENABLE_ALL optimized TTS graphs back into the exported package.",
@@ -118,17 +124,48 @@ def _build_slim_tts_meta(
     }
 
 
-def _save_fp16_model(source_path: Path, target_path: Path, external_data_name: str) -> Path:
+def _save_fp16_model(
+    source_path: Path,
+    target_path: Path,
+    external_data_name: str,
+    *,
+    disable_shape_infer: bool = True,
+    block_rope: bool = True,
+) -> Path:
     try:
         from onnxconverter_common import float16
     except ImportError as exc:
         raise RuntimeError("onnxconverter-common is required for --precision fp16") from exc
     model = onnx.load(str(source_path), load_external_data=True)
+    blocked_ops = list(float16.DEFAULT_OP_BLOCK_LIST)
+    producer_by_output = {
+        output_name: node.name
+        for node in model.graph.node
+        for output_name in node.output
+        if node.name
+    }
+    blocked_node_names = {
+        node.name
+        for node in model.graph.node
+        if node.name and (node.op_type in blocked_ops or (block_rope and "/rope/" in node.name))
+    }
+    for node in model.graph.node:
+        if node.op_type in blocked_ops or (block_rope and "/rope/" in node.name):
+            blocked_node_names.update(
+                producer_by_output[input_name]
+                for input_name in node.input
+                if input_name in producer_by_output
+            )
     converted = float16.convert_float_to_float16(
         model,
         keep_io_types=True,
-        disable_shape_infer=True,
+        disable_shape_infer=disable_shape_infer,
+        op_block_list=blocked_ops,
+        node_block_list=sorted(blocked_node_names) if blocked_node_names else None,
     )
+    external_data_path = target_path.parent / external_data_name
+    if external_data_path.exists():
+        external_data_path.unlink()
     onnx.save_model(
         converted,
         str(target_path),
@@ -156,11 +193,15 @@ def export_optimized_tts(
     codec_onnx_dir: str | Path,
     checkpoint_dir: str | Path,
     precision: str = "fp32",
+    codec_precision: str | None = None,
     offline_ort_optimize: bool = False,
     simplify: bool = False,
 ) -> dict[str, object]:
     if precision not in {"fp32", "fp16"}:
         raise ValueError(f"unsupported precision: {precision}")
+    codec_precision = codec_precision or precision
+    if codec_precision not in {"fp32", "fp16"}:
+        raise ValueError(f"unsupported codec precision: {codec_precision}")
     paths = ensure_run_dirs(run_id)
     tts_source = Path(tts_onnx_dir).expanduser().resolve()
     codec_source = Path(codec_onnx_dir).expanduser().resolve()
@@ -191,6 +232,27 @@ def export_optimized_tts(
             "moss_audio_tokenizer_decode_shared.data",
         ],
     )
+    codec_encode_path = codec_target / "moss_audio_tokenizer_encode.onnx"
+    codec_decode_path = codec_target / "moss_audio_tokenizer_decode_full.onnx"
+    if codec_precision == "fp16":
+        codec_encode_tmp = codec_target / "moss_audio_tokenizer_encode_fp16.tmp.onnx"
+        codec_decode_tmp = codec_target / "moss_audio_tokenizer_decode_full_fp16.tmp.onnx"
+        _save_fp16_model(
+            codec_encode_path,
+            codec_encode_tmp,
+            "moss_audio_tokenizer_encode.data",
+            disable_shape_infer=False,
+            block_rope=False,
+        )
+        _save_fp16_model(
+            codec_decode_path,
+            codec_decode_tmp,
+            "moss_audio_tokenizer_decode_shared.data",
+            disable_shape_infer=False,
+            block_rope=False,
+        )
+        codec_encode_tmp.replace(codec_encode_path)
+        codec_decode_tmp.replace(codec_decode_path)
 
     fp32_prefill_path = save_with_last_hidden_output(
         tts_source / "moss_tts_prefill.onnx",
@@ -243,6 +305,8 @@ def export_optimized_tts(
         "prefill": prefill_path,
         "decode_step": decode_path,
         "local_fixed_sampled_frame": local_fixed_path,
+        "codec_encode": codec_encode_path,
+        "codec_decode_full": codec_decode_path,
     }
     initial_graph_stats = {
         graph_name: graph_stats(graph_path)
@@ -281,6 +345,12 @@ def export_optimized_tts(
         graph_reports["local_fixed_sampled_frame"] = {
             "simplify": simplify_report,
         }
+    actual_simplified = (
+        graph_reports
+        .get("local_fixed_sampled_frame", {})
+        .get("simplify", {})
+        .get("status") == "success"
+    )
 
     if offline_ort_optimize:
         for graph_name, graph_path in list(graph_paths.items()):
@@ -294,7 +364,11 @@ def export_optimized_tts(
             {
                 "enabled": simplify,
                 "status": "skipped",
-                "reason": "only local_fixed_sampled_frame is simplified" if graph_name != "local_fixed_sampled_frame" else "not requested",
+                "reason": (
+                    "only TTS local_fixed_sampled_frame is simplified"
+                    if graph_name != "local_fixed_sampled_frame"
+                    else "not requested"
+                ),
             },
         )
         graph_reports[graph_name].setdefault(
@@ -341,8 +415,10 @@ def export_optimized_tts(
             "mode": "fp16" if precision == "fp16" else "slim",
             "lossless": precision == "fp32",
             "precision": precision,
+            "codec_precision": codec_precision,
             "offline_ort_optimized": offline_ort_optimize,
-            "simplified": simplify,
+            "simplify_requested": simplify,
+            "simplified": actual_simplified,
             "omitted_tts_files": [
                 "browser_poc_manifest.json",
                 "tts_browser_onnx_meta.json",
@@ -395,11 +471,15 @@ def export_optimized_tts(
         "prefill_external_data_locations": sorted(external_data_locations(prefill_path)),
         "decode_external_data_locations": sorted(external_data_locations(decode_path)),
         "local_fixed_sampled_frame_external_data_locations": sorted(external_data_locations(local_fixed_path)),
+        "codec_encode_external_data_locations": sorted(external_data_locations(codec_encode_path)),
+        "codec_decode_full_external_data_locations": sorted(external_data_locations(codec_decode_path)),
         "tts_size_bytes": _directory_file_size(tts_target),
         "codec_size_bytes": _directory_file_size(codec_target),
         "precision": precision,
+        "codec_precision": codec_precision,
         "offline_ort_optimized": offline_ort_optimize,
-        "simplified": simplify,
+        "simplify_requested": simplify,
+        "simplified": actual_simplified,
     }
     write_json(paths["run"] / "export_report.json", report)
     write_json(
@@ -407,8 +487,10 @@ def export_optimized_tts(
         {
             "run_id": paths["run"].name,
             "precision": precision,
+            "codec_precision": codec_precision,
             "offline_ort_optimized": offline_ort_optimize,
-            "simplified": simplify,
+            "simplify_requested": simplify,
+            "simplified": actual_simplified,
             "graphs": graph_reports,
         },
     )
@@ -431,6 +513,7 @@ def main(argv: Sequence[str] | None = None) -> dict[str, object]:
         codec_onnx_dir=args.codec_onnx_dir,
         checkpoint_dir=args.checkpoint_dir,
         precision=args.precision,
+        codec_precision=args.codec_precision,
         offline_ort_optimize=args.offline_ort_optimize,
         simplify=args.simplify,
     )

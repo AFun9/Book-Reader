@@ -55,6 +55,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check optimized export package is slim.")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--mode", choices=("slim", "fp16"), default="slim")
+    parser.add_argument("--codec-precision", choices=("fp32", "fp16"), default=None)
     return parser.parse_args(argv)
 
 
@@ -62,7 +63,7 @@ def directory_file_size(path: Path) -> int:
     return sum(item.stat().st_size for item in path.iterdir() if item.is_file())
 
 
-def assert_slim_export(run_id: str, mode: str = "slim") -> dict[str, object]:
+def assert_slim_export(run_id: str, mode: str = "slim", codec_precision: str | None = None) -> dict[str, object]:
     run_dir = run_dir_for_id(run_id)
     tts_dir = run_dir / "model" / "tts"
     codec_dir = run_dir / "model" / "codec"
@@ -104,6 +105,8 @@ def assert_slim_export(run_id: str, mode: str = "slim") -> dict[str, object]:
     assert not (UNUSED_CODEC_FILES & codec_names), f"unused codec files copied: {sorted(UNUSED_CODEC_FILES & codec_names)}"
 
     assert manifest["package"]["mode"] == mode
+    if codec_precision is not None:
+        assert manifest["package"]["codec_precision"] == codec_precision
     assert manifest["model_files"]["codec_meta"] == "../codec/codec_browser_onnx_meta.json"
     report = {
         "run_id": run_id,
@@ -118,7 +121,7 @@ def assert_slim_export(run_id: str, mode: str = "slim") -> dict[str, object]:
 
 def main(argv: Sequence[str] | None = None) -> dict[str, object]:
     args = parse_args(argv)
-    report = assert_slim_export(args.run_id, mode=args.mode)
+    report = assert_slim_export(args.run_id, mode=args.mode, codec_precision=args.codec_precision)
     print(json.dumps(report, ensure_ascii=False, indent=2))
     return report
 

@@ -40,6 +40,8 @@ def assert_graph_optimization_report(
     report = json.loads(report_path.read_text(encoding="utf-8"))
     graphs = report["graphs"]
     assert {"prefill", "decode_step", "local_fixed_sampled_frame"} <= set(graphs)
+    if expect_ort:
+        assert {"codec_encode", "codec_decode_full"} <= set(graphs)
     for graph_name, graph_report in graphs.items():
         assert graph_report["source_nodes"] > 0, graph_name
         assert graph_report["final_nodes"] > 0, graph_name

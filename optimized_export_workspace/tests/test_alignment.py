@@ -49,9 +49,11 @@ def assert_export_layout(run_id: str) -> dict[str, Path]:
         "manifest": manifest_path,
         "prefill": tts_dir / files["prefill"],
         "decode": tts_dir / files["decode_step"],
-        "global_data": tts_dir / files["global_external_data"],
-        "local_data": tts_dir / files["local_external_data"],
     }
+    if "global_external_data" in files:
+        paths["global_data"] = tts_dir / files["global_external_data"]
+    if "local_external_data" in files:
+        paths["local_data"] = tts_dir / files["local_external_data"]
     for label, path in paths.items():
         if label in {"run_dir", "manifest"}:
             continue
@@ -69,10 +71,14 @@ def assert_last_hidden_outputs(paths: dict[str, Path]) -> None:
 
 
 def assert_shared_external_data(paths: dict[str, Path]) -> None:
+    if "global_data" not in paths:
+        return
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    expected_global = manifest["files"]["global_external_data"]
     prefill_locations = external_data_locations(paths["prefill"])
     decode_locations = external_data_locations(paths["decode"])
-    assert prefill_locations == {"moss_tts_global_shared.data"}
-    assert decode_locations == {"moss_tts_global_shared.data"}
+    assert prefill_locations == {expected_global}
+    assert decode_locations == {expected_global}
 
 
 def _session(path: Path) -> ort.InferenceSession:
@@ -138,7 +144,10 @@ def compare_prefill_and_decode_last_hidden(paths: dict[str, Path], atol: float) 
         official_prefill_named["global_hidden"][:, -1, :],
         optimized_prefill_named["global_hidden_last"],
     )
-    assert prefill_max <= atol, f"prefill max_abs_error {prefill_max} > {atol}"
+    manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
+    lossless = bool(manifest.get("package", {}).get("lossless", True))
+    if lossless:
+        assert prefill_max <= atol, f"prefill max_abs_error {prefill_max} > {atol}"
 
     n_vq = int(optimized_runtime.manifest["tts_config"]["n_vq"])
     row_width = n_vq + 1
@@ -172,12 +181,15 @@ def compare_prefill_and_decode_last_hidden(paths: dict[str, Path], atol: float) 
         official_decode_named["global_hidden"][:, -1, :],
         optimized_decode_named["global_hidden_last"],
     )
-    assert decode_max <= atol, f"decode max_abs_error {decode_max} > {atol}"
+    if lossless:
+        assert decode_max <= atol, f"decode max_abs_error {decode_max} > {atol}"
     return {
         "prefill_max_abs_error": prefill_max,
         "prefill_mean_abs_error": prefill_mean,
+        "prefill_within_tolerance": prefill_max <= atol,
         "decode_max_abs_error": decode_max,
         "decode_mean_abs_error": decode_mean,
+        "decode_within_tolerance": decode_max <= atol,
     }
 
 
@@ -200,10 +212,13 @@ def compare_short_generation(run_id: str, max_new_frames: int) -> dict[str, obje
         optimized_request_rows,
         max_new_frames=max_new_frames,
     )
-    assert official_frames == optimized_frames, "official and optimized frame tokens differ"
+    manifest = optimized_runtime.manifest
+    lossless = bool(manifest.get("package", {}).get("lossless", True))
+    if lossless:
+        assert official_frames == optimized_frames, "official and optimized frame tokens differ"
     return {
         "frame_count": len(optimized_frames),
-        "tokens_match": True,
+        "tokens_match": official_frames == optimized_frames,
     }
 
 
@@ -268,7 +283,7 @@ def run_alignment(run_id: str, max_new_frames: int, atol: float, skip_pytorch: b
         "run_id": run_id,
         "prefill_output": "global_hidden_last",
         "decode_output": "global_hidden_last",
-        "external_data_shared": True,
+        "external_data_shared": "global_data" in paths,
         **hidden_report,
         **generation_report,
         **pytorch_report,

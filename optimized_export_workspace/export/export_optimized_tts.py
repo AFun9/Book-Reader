@@ -30,9 +30,12 @@ from optimized_export_workspace.common import (
     write_json,
 )
 from optimized_export_workspace.export.graph_opt import (
+    export_ort_optimized_model,
     external_data_locations,
+    graph_stats,
     load_output_shapes,
     save_with_last_hidden_output,
+    simplify_model_to_external_data,
 )
 
 
@@ -47,6 +50,16 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         choices=("fp32", "fp16"),
         default="fp32",
         help="TTS graph weight precision. fp16 reduces size and keeps graph I/O as fp32.",
+    )
+    parser.add_argument(
+        "--offline-ort-optimize",
+        action="store_true",
+        help="Save ORT_ENABLE_ALL optimized TTS graphs back into the exported package.",
+    )
+    parser.add_argument(
+        "--simplify",
+        action="store_true",
+        help="Run onnx-simplifier on the local fixed-frame graph before optional ORT optimization.",
     )
     return parser.parse_args(argv)
 
@@ -143,6 +156,8 @@ def export_optimized_tts(
     codec_onnx_dir: str | Path,
     checkpoint_dir: str | Path,
     precision: str = "fp32",
+    offline_ort_optimize: bool = False,
+    simplify: bool = False,
 ) -> dict[str, object]:
     if precision not in {"fp32", "fp16"}:
         raise ValueError(f"unsupported precision: {precision}")
@@ -188,12 +203,14 @@ def export_optimized_tts(
     prefill_file = "moss_tts_prefill_last.onnx"
     decode_file = "moss_tts_decode_step_last.onnx"
     local_fixed_file = "moss_tts_local_fixed_sampled_frame.onnx"
+    local_external_data_file = "moss_tts_local_shared.data"
     if precision == "fp16":
         prefill_file = "moss_tts_prefill_last_fp16.onnx"
         decode_file = "moss_tts_decode_step_last_fp16.onnx"
         local_fixed_file = "moss_tts_local_fixed_sampled_frame_fp16.onnx"
         global_fp16_data = "moss_tts_global_fp16_shared.data"
         local_fp16_data = "moss_tts_local_fixed_sampled_frame_fp16.data"
+        local_external_data_file = local_fp16_data
         prefill_path = _save_fp16_model(fp32_prefill_path, tts_target / prefill_file, global_fp16_data)
         decode_temp_data = "moss_tts_decode_step_last_fp16.tmp.data"
         decode_path = _save_fp16_model(fp32_decode_path, tts_target / decode_file, decode_temp_data)
@@ -221,6 +238,92 @@ def export_optimized_tts(
         decode_path = fp32_decode_path
         local_fixed_path = tts_target / local_fixed_file
 
+    graph_reports: dict[str, Any] = {}
+    graph_paths = {
+        "prefill": prefill_path,
+        "decode_step": decode_path,
+        "local_fixed_sampled_frame": local_fixed_path,
+    }
+    initial_graph_stats = {
+        graph_name: graph_stats(graph_path)
+        for graph_name, graph_path in graph_paths.items()
+    }
+    if simplify:
+        local_simplified_file = (
+            "moss_tts_local_fixed_sampled_frame_simplified.onnx"
+            if precision == "fp32"
+            else "moss_tts_local_fixed_sampled_frame_fp16_simplified.onnx"
+        )
+        local_simplified_data = (
+            "moss_tts_local_fixed_sampled_frame_simplified.data"
+            if precision == "fp32"
+            else "moss_tts_local_fixed_sampled_frame_fp16_simplified.data"
+        )
+        simplify_report = simplify_model_to_external_data(
+            local_fixed_path,
+            tts_target / local_simplified_file,
+            external_data_name=local_simplified_data,
+        )
+        if simplify_report["status"] == "success":
+            if local_fixed_path.exists():
+                local_fixed_path.unlink()
+            old_local_data = tts_target / (
+                "moss_tts_local_fixed_sampled_frame_fp16.data"
+                if precision == "fp16"
+                else "moss_tts_local_shared.data"
+            )
+            if old_local_data.exists():
+                old_local_data.unlink()
+            local_fixed_file = local_simplified_file
+            local_external_data_file = local_simplified_data
+            local_fixed_path = tts_target / local_fixed_file
+            graph_paths["local_fixed_sampled_frame"] = local_fixed_path
+        graph_reports["local_fixed_sampled_frame"] = {
+            "simplify": simplify_report,
+        }
+
+    if offline_ort_optimize:
+        for graph_name, graph_path in list(graph_paths.items()):
+            graph_reports.setdefault(graph_name, {})
+            graph_reports[graph_name]["ort"] = export_ort_optimized_model(graph_path, thread_count=1)
+
+    for graph_name, graph_path in graph_paths.items():
+        graph_reports.setdefault(graph_name, {})
+        graph_reports[graph_name].setdefault(
+            "simplify",
+            {
+                "enabled": simplify,
+                "status": "skipped",
+                "reason": "only local_fixed_sampled_frame is simplified" if graph_name != "local_fixed_sampled_frame" else "not requested",
+            },
+        )
+        graph_reports[graph_name].setdefault(
+            "ort",
+            {
+                "enabled": offline_ort_optimize,
+                "status": "skipped",
+                "reason": "not requested",
+            },
+        )
+        # Capture stats after all requested transformations have been applied.
+        final_stats = graph_stats(graph_path)
+        source_stats = initial_graph_stats[graph_name]
+        if graph_reports[graph_name]["simplify"].get("before_nodes"):
+            source_nodes = graph_reports[graph_name]["simplify"]["before_nodes"]
+        elif graph_reports[graph_name]["ort"].get("before_nodes"):
+            source_nodes = graph_reports[graph_name]["ort"]["before_nodes"]
+        else:
+            source_nodes = final_stats["nodes"]
+        graph_reports[graph_name].update(
+            {
+                "source_nodes": source_nodes,
+                "final_nodes": final_stats["nodes"],
+                "final_size_bytes": final_stats["size_bytes"],
+                "source_op_counts": source_stats["op_counts"],
+                "final_op_counts": final_stats["op_counts"],
+            }
+        )
+
     official_manifest = read_json(tts_source / "browser_poc_manifest.json")
     official_tts_meta = read_json(tts_source / "tts_browser_onnx_meta.json")
     optimized_meta = _build_slim_tts_meta(
@@ -238,6 +341,8 @@ def export_optimized_tts(
             "mode": "fp16" if precision == "fp16" else "slim",
             "lossless": precision == "fp32",
             "precision": precision,
+            "offline_ort_optimized": offline_ort_optimize,
+            "simplified": simplify,
             "omitted_tts_files": [
                 "browser_poc_manifest.json",
                 "tts_browser_onnx_meta.json",
@@ -265,12 +370,12 @@ def export_optimized_tts(
             **(
                 {
                     "global_external_data": "moss_tts_global_fp16_shared.data",
-                    "local_external_data": "moss_tts_local_fixed_sampled_frame_fp16.data",
+                    "local_external_data": local_external_data_file,
                 }
                 if precision == "fp16"
                 else {
                     "global_external_data": "moss_tts_global_shared.data",
-                    "local_external_data": "moss_tts_local_shared.data",
+                    "local_external_data": local_external_data_file,
                 }
             ),
         },
@@ -293,8 +398,20 @@ def export_optimized_tts(
         "tts_size_bytes": _directory_file_size(tts_target),
         "codec_size_bytes": _directory_file_size(codec_target),
         "precision": precision,
+        "offline_ort_optimized": offline_ort_optimize,
+        "simplified": simplify,
     }
     write_json(paths["run"] / "export_report.json", report)
+    write_json(
+        paths["run"] / "graph_optimization_report.json",
+        {
+            "run_id": paths["run"].name,
+            "precision": precision,
+            "offline_ort_optimized": offline_ort_optimize,
+            "simplified": simplify,
+            "graphs": graph_reports,
+        },
+    )
     write_json(
         paths["logs"] / "export_log.json",
         {
@@ -314,6 +431,8 @@ def main(argv: Sequence[str] | None = None) -> dict[str, object]:
         codec_onnx_dir=args.codec_onnx_dir,
         checkpoint_dir=args.checkpoint_dir,
         precision=args.precision,
+        offline_ort_optimize=args.offline_ort_optimize,
+        simplify=args.simplify,
     )
     print(f"optimized export complete: {report['manifest']}")
     return report

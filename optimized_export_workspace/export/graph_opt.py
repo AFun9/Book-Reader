@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import shutil
+from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import onnx
+import onnxruntime as ort
 from onnx import TensorProto, helper
 
 
@@ -26,6 +30,114 @@ def external_data_locations(model_path: str | Path) -> set[str]:
             if entry.key == "location":
                 locations.add(entry.value)
     return locations
+
+
+def graph_stats(model_path: str | Path) -> dict[str, Any]:
+    path = Path(model_path)
+    model = onnx.load(str(path), load_external_data=False)
+    op_counts = Counter(node.op_type for node in model.graph.node)
+    return {
+        "path": str(path),
+        "nodes": len(model.graph.node),
+        "initializers": len(model.graph.initializer),
+        "size_bytes": path.stat().st_size,
+        "external_data_locations": sorted(external_data_locations(path)),
+        "op_counts": dict(sorted(op_counts.items())),
+    }
+
+
+def export_ort_optimized_model(model_path: str | Path, *, thread_count: int = 1) -> dict[str, Any]:
+    path = Path(model_path)
+    temp_path = path.with_name(path.stem + ".ort_tmp.onnx")
+    if temp_path.exists():
+        temp_path.unlink()
+    options = ort.SessionOptions()
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    options.optimized_model_filepath = str(temp_path)
+    options.intra_op_num_threads = max(1, int(thread_count))
+    options.inter_op_num_threads = 1
+    before = graph_stats(path)
+    try:
+        ort.InferenceSession(str(path), sess_options=options, providers=["CPUExecutionProvider"])
+        if not temp_path.is_file():
+            raise RuntimeError(f"ORT did not write optimized model: {temp_path}")
+        shutil.move(str(temp_path), str(path))
+        onnx.checker.check_model(str(path))
+        after = graph_stats(path)
+        return {
+            "enabled": True,
+            "status": "success",
+            "before_nodes": before["nodes"],
+            "after_nodes": after["nodes"],
+            "before_size_bytes": before["size_bytes"],
+            "after_size_bytes": after["size_bytes"],
+        }
+    except Exception as exc:
+        if temp_path.exists():
+            temp_path.unlink()
+        return {
+            "enabled": True,
+            "status": "failed",
+            "error": str(exc),
+            "before_nodes": before["nodes"],
+            "after_nodes": before["nodes"],
+            "before_size_bytes": before["size_bytes"],
+            "after_size_bytes": before["size_bytes"],
+        }
+
+
+def simplify_model_to_external_data(
+    source_path: str | Path,
+    target_path: str | Path,
+    *,
+    external_data_name: str,
+) -> dict[str, Any]:
+    source = Path(source_path)
+    target = Path(target_path)
+    before = graph_stats(source)
+    try:
+        from onnxsim import simplify
+    except ImportError as exc:
+        return {
+            "enabled": True,
+            "status": "skipped",
+            "reason": f"onnxsim unavailable: {exc}",
+            "before_nodes": before["nodes"],
+            "after_nodes": before["nodes"],
+        }
+    try:
+        model = onnx.load(str(source), load_external_data=True)
+        simplified, ok = simplify(model, perform_optimization=True, skip_fuse_bn=True)
+        if not ok:
+            raise RuntimeError("onnxsim returned check=False")
+        onnx.save_model(
+            simplified,
+            str(target),
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=external_data_name,
+            size_threshold=1024,
+        )
+        onnx.checker.check_model(str(target))
+        after = graph_stats(target)
+        return {
+            "enabled": True,
+            "status": "success",
+            "before_nodes": before["nodes"],
+            "after_nodes": after["nodes"],
+            "before_size_bytes": before["size_bytes"],
+            "after_size_bytes": after["size_bytes"],
+        }
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "status": "failed",
+            "error": str(exc),
+            "before_nodes": before["nodes"],
+            "after_nodes": before["nodes"],
+            "before_size_bytes": before["size_bytes"],
+            "after_size_bytes": before["size_bytes"],
+        }
 
 
 def save_with_last_hidden_output(

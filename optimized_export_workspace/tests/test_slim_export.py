@@ -71,6 +71,9 @@ def assert_slim_export(run_id: str, mode: str = "slim") -> dict[str, object]:
 
     tts_names = {item.name for item in tts_dir.iterdir() if item.is_file()}
     codec_names = {item.name for item in codec_dir.iterdir() if item.is_file()}
+    manifest = json.loads((tts_dir / "optimized_manifest.json").read_text(encoding="utf-8"))
+    package = manifest["package"]
+    is_simplified = bool(package.get("simplified", False))
     if mode == "fp16":
         required_tts_files = {
             "optimized_manifest.json",
@@ -82,6 +85,17 @@ def assert_slim_export(run_id: str, mode: str = "slim") -> dict[str, object]:
             "moss_tts_global_fp16_shared.data",
             "moss_tts_local_fixed_sampled_frame_fp16.data",
         }
+    elif is_simplified:
+        required_tts_files = {
+            "optimized_manifest.json",
+            "optimized_tts_meta.json",
+            "tokenizer.model",
+            "moss_tts_prefill_last.onnx",
+            "moss_tts_decode_step_last.onnx",
+            "moss_tts_local_fixed_sampled_frame_simplified.onnx",
+            "moss_tts_global_shared.data",
+            "moss_tts_local_fixed_sampled_frame_simplified.data",
+        }
     else:
         required_tts_files = REQUIRED_TTS_FILES
     assert required_tts_files <= tts_names, f"missing TTS files: {sorted(required_tts_files - tts_names)}"
@@ -89,7 +103,6 @@ def assert_slim_export(run_id: str, mode: str = "slim") -> dict[str, object]:
     assert not (UNUSED_TTS_FILES & tts_names), f"unused TTS files copied: {sorted(UNUSED_TTS_FILES & tts_names)}"
     assert not (UNUSED_CODEC_FILES & codec_names), f"unused codec files copied: {sorted(UNUSED_CODEC_FILES & codec_names)}"
 
-    manifest = json.loads((tts_dir / "optimized_manifest.json").read_text(encoding="utf-8"))
     assert manifest["package"]["mode"] == mode
     assert manifest["model_files"]["codec_meta"] == "../codec/codec_browser_onnx_meta.json"
     report = {
